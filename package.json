@@ -1,0 +1,46 @@
+{
+  "name": "hyperbee-compat",
+  "version": "0.0.1",
+  "description": "hyperbee-compat",
+  "main": "index.js",
+  "exports": {
+    "./package": "./package.json",
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "package.json",
+    "index.js",
+    "index.d.ts"
+  ],
+  "devDependencies": {
+    "brittle": "^3.19.0",
+    "lunte": "^1.2.0",
+    "prettier": "^3.6.2",
+    "prettier-config-holepunch": "^2.0.0"
+  },
+  "scripts": {
+    "format": "prettier . --write",
+    "test": "brittle-bare test/index.js",
+    "lint": "prettier . --check && lunte"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/holepunchto/hyperbee-compat.git"
+  },
+  "author": "Holepunch Inc",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/holepunchto/hyperbee-compat/issues"
+  },
+  "homepage": "https://github.com/holepunchto/hyperbee-compat",
+  "dependencies": {
+    "b4a": "^1.8.1",
+    "codecs": "^3.1.0",
+    "corestore": "^7.10.1",
+    "hyperbee2": "^2.10.2",
+    "streamx": "^2.27.0"
+  }
+}
