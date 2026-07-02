@@ -6,20 +6,34 @@ const SEP = b4a.alloc(1)
 const EMPTY = b4a.alloc(0)
 
 class WriteBatch {
-  constructor(batch, encoding) {
+  constructor(parent, batch, encoding) {
+    this.parent = parent
     this.batch = batch
+    this.snapshotLength = this.parent.length
     this.encoding = encoding
+    this.puts = []
+    this.trace = new Error().stack
   }
 
-  tryPut(key, value) {
-    this.batch.tryPut(enc(this.encoding.key, key), enc(this.encoding.value, value))
+  get core() {
+    const self = this
+    return {
+      get length() {
+        return self.snapshotLength + self.puts.length
+      }
+    }
   }
 
-  tryDelete(key) {
-    this.batch.tryDelete(enc(this.encoding.key, key))
+  put(key, value, opts) {
+    const encoding = this._getEncoding(opts)
+    this.batch.tryPut(enc(encoding.key, key), enc(encoding.value, value))
   }
 
-  tryClear() {
+  del(key, opts) {
+    this.batch.tryDelete(enc(this._getEncoding(opts).key, key))
+  }
+
+  clear() {
     this.batch.tryClear()
   }
 
@@ -31,8 +45,82 @@ class WriteBatch {
     return this.batch.flush()
   }
 
+  async get(key, opts) {
+    const encoding = this._getEncoding(opts)
+    const target = enc(encoding.key, key)
+
+    for (const op of this.batch.ops) {
+      if (!b4a.equals(op.key, target)) continue
+
+      if (op.type === 'delete') return null
+      return final(op, encoding)
+    }
+
+    const data = await this.parent.get(key, { ...this.encoding, ...opts })
+    return data
+  }
+
+  createReadStream(range, opts) {
+    opts = opts ? { ...opts, ...range } : range
+
+    const encoding = this.parent._getEncoding(opts)
+    const stream = this.batch.snapshot.createReadStream(
+      this.parent._encRange(encoding.key, { ...opts, ...range })
+    )
+
+    return pipeline(
+      stream,
+      new Transform({
+        transform: (entry, cb) => {
+          for (const op of this.batch.ops) {
+            if (b4a.equals(op.key, entry.key)) {
+              if (op.type === 'delete') return cb(null)
+              return cb(null, final(op, encoding))
+            }
+          }
+          cb(null, final(entry, encoding))
+        }
+      })
+    )
+  }
+
+  createDiffStream(right, range, opts) {
+    if (right instanceof Wrapper) right = right.bee
+
+    // backwards compat range arg
+    opts = opts ? { ...opts, ...range } : range
+
+    const encoding = this.parent._getEncoding({ ...this.encoding, ...opts })
+    const stream = this.batch.createDiffStream(
+      right,
+      this.parent._encRange(encoding, { ...opts, ...range })
+    )
+
+    return pipeline(
+      stream,
+      new Transform({
+        transform(diff, cb) {
+          cb(null, {
+            left: final(diff.left, encoding),
+            right: final(diff.right, encoding)
+          })
+        }
+      })
+    )
+  }
+
+  async peek(range, opts) {
+    for await (const entry of this.createReadStream(range, opts)) {
+      return entry
+    }
+  }
+
   close() {
     return this.batch.close()
+  }
+
+  _getEncoding(opts = {}) {
+    return this.parent._getEncoding({ ...this.encoding, ...opts })
   }
 }
 
@@ -49,6 +137,18 @@ class Wrapper {
     this._autoClose = opts.autoClose !== false
 
     if (this.prefix) this.keyEncoding = prefixEncoding(this.prefix, this._unprefixedKeyEncoding)
+  }
+
+  get core() {
+    return {
+      get length() {
+        return this.bee.head().length
+      }
+    }
+  }
+
+  get isSub() {
+    return !!this.prefix
   }
 
   get core() {
@@ -161,19 +261,19 @@ class Wrapper {
     )
   }
 
-  write(opts) {
-    return new WriteBatch(this.bee.write(opts), this._getEncoding(opts))
+  batch(opts) {
+    return new WriteBatch(this, this.bee.write(opts), this._getEncoding(opts))
   }
 
   put(key, value, opts) {
-    const batch = this.write(opts)
-    batch.tryPut(key, value)
+    const batch = this.batch(opts)
+    batch.put(key, value)
     return batch.flush()
   }
 
   del(key, opts) {
-    const batch = this.write(opts)
-    batch.tryDelete(key)
+    const batch = this.batch(opts)
+    batch.del(key)
     return batch.flush()
   }
 
