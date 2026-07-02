@@ -1,6 +1,6 @@
 {
   "name": "hyperbee-compat",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "description": "hyperbee-compat",
   "main": "index.js",
   "exports": {
