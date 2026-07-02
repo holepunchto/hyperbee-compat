@@ -266,14 +266,14 @@ class Wrapper {
   }
 
   put(key, value, opts) {
-    const batch = this.write(opts)
-    batch.tryPut(key, value)
+    const batch = this.batch(opts)
+    batch.put(key, value)
     return batch.flush()
   }
 
   del(key, opts) {
-    const batch = this.write(opts)
-    batch.tryDelete(key)
+    const batch = this.batch(opts)
+    batch.del(key)
     return batch.flush()
   }
 

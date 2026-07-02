@@ -30,8 +30,8 @@ test('wrapper - per-call encoding overrides', async function (t) {
 test('wrapper - createReadStream encodes range and decodes entries', async function (t) {
   const db = await create(t, { keyEncoding: 'utf-8', valueEncoding: 'json' })
 
-  const batch = db.write()
-  for (const k of ['a', 'b', 'c', 'd']) batch.tryPut(k, { k })
+  const batch = db.batch()
+  for (const k of ['a', 'b', 'c', 'd']) batch.put(k, { k })
   await batch.flush()
 
   const entries = []
