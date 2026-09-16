@@ -1,17 +1,18 @@
 const b4a = require('b4a')
 const codecs = require('codecs')
-const { Transform, pipeline } = require('streamx')
+const { Readable, Transform, pipeline } = require('streamx')
 
 const SEP = b4a.alloc(1)
 const EMPTY = b4a.alloc(0)
 
 class WriteBatch {
-  constructor(parent, batch, encoding) {
+  constructor(parent, batch, opts) {
     this.parent = parent
     this.batch = batch
-    this.snapshotLength = this.parent.length
-    this.encoding = encoding
-    this.puts = []
+    this.opts = opts || null
+    this.encoding = parent._getEncoding(opts)
+    this.snapshotLength = parent.core.length
+    this.cleared = false
     this.trace = new Error().stack
   }
 
@@ -19,7 +20,10 @@ class WriteBatch {
     const self = this
     return {
       get length() {
-        return self.snapshotLength + self.puts.length
+        // approximate, a put of an existing key does not grow the tree
+        let length = self.snapshotLength
+        for (const op of self.batch.ops) if (op.put) length++
+        return length
       }
     }
   }
@@ -34,6 +38,7 @@ class WriteBatch {
   }
 
   clear() {
+    this.cleared = true
     this.batch.tryClear()
   }
 
@@ -46,67 +51,141 @@ class WriteBatch {
   }
 
   async get(key, opts) {
+    this.batch.checkIfClosed()
+
     const encoding = this._getEncoding(opts)
     const target = enc(encoding.key, key)
 
-    for (const op of this.batch.ops) {
-      if (!b4a.equals(op.key, target)) continue
+    const overlay = this._overlay(target, encoding)
+    if (overlay !== undefined) return overlay
 
-      if (op.type === 'delete') return null
-      return final(op, encoding)
+    const entry = await this.batch.snapshot.get(target)
+
+    // ops may have been added while we were reading, they still win
+    const latest = this._overlay(target, encoding)
+    if (latest !== undefined) return latest
+
+    return final(entry, encoding)
+  }
+
+  // undefined means the batch has nothing to say about this key
+  _overlay(target, encoding) {
+    const op = this._lastOp(target)
+    if (op !== null) return op.put ? final(entryFromOp(op), encoding) : null
+    return this.cleared ? null : undefined
+  }
+
+  // last write wins, so scan backwards
+  _lastOp(target) {
+    for (let i = this.batch.ops.length - 1; i >= 0; i--) {
+      const op = this.batch.ops[i]
+      if (b4a.equals(op.key, target)) return op
     }
-
-    const data = await this.parent.get(key, { ...this.encoding, ...opts })
-    return data
+    return null
   }
 
   createReadStream(range, opts) {
+    this.batch.checkIfClosed()
+
     opts = opts ? { ...opts, ...range } : range
 
-    const encoding = this.parent._getEncoding(opts)
-    const stream = this.batch.snapshot.createReadStream(
-      this.parent._encRange(encoding.key, { ...opts, ...range })
-    )
+    const encoding = this._getEncoding(opts)
+    const r = this.parent._encRange(encoding.key, { ...opts, ...range })
 
-    return pipeline(
-      stream,
-      new Transform({
-        transform: (entry, cb) => {
-          for (const op of this.batch.ops) {
-            if (b4a.equals(op.key, entry.key)) {
-              if (op.type === 'delete') return cb(null)
-              return cb(null, final(op, encoding))
-            }
-          }
-          cb(null, final(entry, encoding))
-        }
+    return Readable.from(this._read(r, encoding))
+  }
+
+  async *_read(range, encoding) {
+    for await (const entry of this._entries(range)) yield final(entry, encoding)
+  }
+
+  // simple, not efficient: materialise the range then overlay the pending ops
+  async *_entries(range) {
+    const entries = new Map()
+
+    if (!this.cleared) {
+      const stream = this.batch.snapshot.createReadStream({
+        ...range,
+        reverse: false,
+        limit: -1
       })
-    )
+
+      for await (const entry of stream) {
+        entries.set(b4a.toString(entry.key, 'hex'), entry)
+      }
+    }
+
+    for (const op of this.batch.ops) {
+      if (!inRange(op.key, range)) continue
+
+      const id = b4a.toString(op.key, 'hex')
+
+      if (op.put) entries.set(id, entryFromOp(op))
+      else entries.delete(id)
+    }
+
+    const sorted = [...entries.values()].sort(compareEntries)
+    if (range.reverse) sorted.reverse()
+
+    const limit = toLimit(range.limit)
+
+    let yielded = 0
+    for (const entry of sorted) {
+      if (yielded++ >= limit) return
+      yield entry
+    }
   }
 
   createDiffStream(right, range, opts) {
+    this.batch.checkIfClosed()
+
     if (right instanceof Wrapper) right = right.bee
+    else if (right instanceof WriteBatch) right = right.batch.snapshot
 
     // backwards compat range arg
     opts = opts ? { ...opts, ...range } : range
 
-    const encoding = this.parent._getEncoding({ ...this.encoding, ...opts })
-    const stream = this.batch.createDiffStream(
-      right,
-      this.parent._encRange(encoding, { ...opts, ...range })
-    )
+    const encoding = this._getEncoding(opts)
+    const r = this.parent._encRange(encoding.key, { ...opts, ...range })
 
-    return pipeline(
-      stream,
-      new Transform({
-        transform(diff, cb) {
-          cb(null, {
-            left: final(diff.left, encoding),
-            right: final(diff.right, encoding)
-          })
-        }
-      })
-    )
+    return Readable.from(this._diff(right, r, encoding))
+  }
+
+  async *_diff(right, range, encoding) {
+    const lefts = new Map()
+    const rights = new Map()
+
+    for await (const entry of this._entries({ ...range, reverse: false, limit: -1 })) {
+      lefts.set(b4a.toString(entry.key, 'hex'), entry)
+    }
+
+    for await (const entry of right.createReadStream({ ...range, reverse: false, limit: -1 })) {
+      rights.set(b4a.toString(entry.key, 'hex'), entry)
+    }
+
+    const diffs = []
+
+    for (const [id, left] of lefts) {
+      const r = rights.get(id) || null
+      if (r !== null && sameValue(left.value, r.value)) continue
+      diffs.push({ key: left.key, left, right: r })
+    }
+
+    for (const [id, r] of rights) {
+      if (lefts.has(id)) continue
+      diffs.push({ key: r.key, left: null, right: r })
+    }
+
+    diffs.sort(compareEntries)
+    if (range.reverse) diffs.reverse()
+
+    const limit = toLimit(range.limit)
+
+    let yielded = 0
+    for (const diff of diffs) {
+      if (yielded++ >= limit) return
+      yield { left: final(diff.left, encoding), right: final(diff.right, encoding) }
+    }
   }
 
   async peek(range, opts) {
@@ -119,8 +198,9 @@ class WriteBatch {
     return this.batch.close()
   }
 
-  _getEncoding(opts = {}) {
-    return this.parent._getEncoding({ ...this.encoding, ...opts })
+  _getEncoding(opts) {
+    if (!opts || (!opts.keyEncoding && !opts.valueEncoding)) return this.encoding
+    return this.parent._getEncoding(this.opts ? { ...this.opts, ...opts } : opts)
   }
 }
 
@@ -137,14 +217,6 @@ class Wrapper {
     this._autoClose = opts.autoClose !== false
 
     if (this.prefix) this.keyEncoding = prefixEncoding(this.prefix, this._unprefixedKeyEncoding)
-  }
-
-  get core() {
-    return {
-      get length() {
-        return this.bee.head().length
-      }
-    }
   }
 
   get isSub() {
@@ -262,7 +334,7 @@ class Wrapper {
   }
 
   batch(opts) {
-    return new WriteBatch(this, this.bee.write(opts), this._getEncoding(opts))
+    return new WriteBatch(this, this.bee.write(opts), opts)
   }
 
   put(key, value, opts) {
@@ -365,14 +437,40 @@ function prefixEncoding(prefix, keyEncoding) {
 
 function final(entry, encoding) {
   if (!entry) return null
+  // hyperbee 1 entries are plain { seq, key, value }, do not leak tree internals
   return {
-    ...entry,
+    seq: entry.seq,
     key: encoding.key ? encoding.key.decode(entry.key) : entry.key,
     value:
       entry.value === null || entry.value === undefined || encoding.value === null
         ? entry.value
         : encoding.value.decode(entry.value)
   }
+}
+
+function toLimit(limit) {
+  return limit === undefined || limit === null || limit < 0 ? Infinity : limit
+}
+
+function sameValue(a, b) {
+  if (a === null || a === undefined || b === null || b === undefined) return a === b
+  return b4a.equals(a, b)
+}
+
+function entryFromOp(op) {
+  return { seq: 0, key: op.key, value: op.value }
+}
+
+function compareEntries(a, b) {
+  return b4a.compare(a.key, b.key)
+}
+
+function inRange(key, range) {
+  if (range.gt !== undefined && range.gt !== null && b4a.compare(key, range.gt) <= 0) return false
+  if (range.gte !== undefined && range.gte !== null && b4a.compare(key, range.gte) < 0) return false
+  if (range.lt !== undefined && range.lt !== null && b4a.compare(key, range.lt) >= 0) return false
+  if (range.lte !== undefined && range.lte !== null && b4a.compare(key, range.lte) > 0) return false
+  return true
 }
 
 function toBuffer(v) {
